@@ -148,6 +148,14 @@ therefore does not suspend control until the next frame. Rendering and sending
 still run in the same loop, so this is best-effort timing rather than a hard
 real-time guarantee.
 
+After a delayed loop iteration, position is integrated using the previous
+velocity only until the previous command's timeout deadline. The remaining
+elapsed time is simulated with zero velocity. A new command or duplicate
+keepalive received after the delay cannot extend old motion retroactively.
+Time-based battery drain covers the entire gap; motion-based drain covers only
+the time spent moving. This correction happens when the loop resumes; the
+watchdog cannot execute while that same loop is stalled.
+
 ## Run on two computers over a LAN
 
 Install the project on both computers. Identify each computer's LAN IPv4 address
@@ -321,6 +329,9 @@ the remaining direction, and INFO logs match the velocity transitions. Timers
 and polling are driven explicitly for this test. Logging tests cover level filtering,
 console/file output, UTF-8, bounded rotation, inaccessible-file fallback,
 handler cleanup, fatal tracebacks and watchdog transition events.
+Deterministic simulator-loop tests inject a two-second clock gap and verify
+bounded movement with no new command, a new opposite command, or a duplicate
+keepalive, as well as correct battery drain across command expiry.
 
 ## Troubleshooting and current limitations
 

@@ -80,6 +80,38 @@ def command_after_timeout(
     return active
 
 
+def advance_state_with_timeout(
+    state: DroneState,
+    *,
+    last_update_ns: int,
+    now_ns: int,
+    last_command_ns: int | None,
+    timeout_ns: int,
+) -> DroneState:
+    """Integrate old motion up to its deadline, then idle for the remaining gap.
+
+    last_command_ns must describe the command preceding this interval, before
+    newly received commands or keepalives refresh its receipt time.
+    """
+    previous = VelocityCommand(state.vx, state.vy, state.last_seq)
+    at_start = command_after_timeout(last_command_ns, last_update_ns, timeout_ns, previous)
+    at_end = command_after_timeout(last_command_ns, now_ns, timeout_ns, at_start)
+    elapsed_ns = now_ns - last_update_ns
+    if elapsed_ns < 0:
+        raise ValueError("Update time must not move backwards")
+
+    moving_ns = 0
+    if last_command_ns is not None and last_command_ns <= last_update_ns:
+        remaining_ns = max(0, last_command_ns + timeout_ns - last_update_ns)
+        moving_ns = min(elapsed_ns, remaining_ns)
+
+    state = apply_command(state, at_start)
+    state = advance_state(state, moving_ns / 1_000_000_000)
+    state = apply_command(state, at_end)
+    # The stationary remainder still consumes the time-based battery drain.
+    return advance_state(state, (elapsed_ns - moving_ns) / 1_000_000_000)
+
+
 def should_accept_command(
     incoming: VelocityCommand,
     current: VelocityCommand,
@@ -216,22 +248,24 @@ def run_simulator(args: argparse.Namespace) -> None:
 
         while True:
 
-            # 1. Receive pending commands.
+            # 1. Preserve old validity before commands/keepalives refresh it.
+            previous_command_ns = last_command_ns
             active_command, last_command_ns = receive_commands(
                 command_socket,
                 active_command,
                 last_command_ns,
             )
 
-            # 2. Calculate elapsed time.
+            # 2. Capture the end of this elapsed interval.
             now_ns = time.monotonic_ns()
 
-            dt_s = (now_ns - last_update_ns) / 1_000_000_000
+            # 3. Old motion ends at its old deadline, even after a long stall.
+            # Newly received commands affect only subsequent intervals.
+            state = advance_state_with_timeout(
+                state, last_update_ns=last_update_ns, now_ns=now_ns,
+                last_command_ns=previous_command_ns, timeout_ns=timeout_ns,
+            )
             last_update_ns = now_ns
-
-            # 3. Integrate the velocity that was active during this interval.
-            # A newly received command must not move the drone retroactively.
-            state = advance_state(state, dt_s)
 
             # 4. Apply the command watchdog and update the current velocity.
             effective_command = command_after_timeout(
