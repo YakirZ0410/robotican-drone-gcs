@@ -224,10 +224,10 @@ class GCSWindow(QMainWindow):
         """Display matching data and detect loss using the local clock."""
 
         now = time.monotonic()
-        latest = self.client.latest_frame()
+        snapshot = self.client.latest_snapshot()
 
-        if latest is not None:
-            frame_id, timestamp_ns, jpeg = latest
+        if snapshot is not None:
+            frame_id, timestamp_ns, jpeg, telemetry = snapshot
             frame_key = (frame_id, timestamp_ns)
 
             if frame_key != self.last_displayed_frame:
@@ -254,7 +254,6 @@ class GCSWindow(QMainWindow):
 
             # Never pair telemetry for an undecodable image with the old image.
             if frame_key == self.last_displayed_frame:
-                telemetry = self.client.telemetry_for(frame_id)
                 if telemetry is not None and (
                     telemetry["frame_id"], telemetry["timestamp_ns"]
                 ) == frame_key:

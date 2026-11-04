@@ -81,11 +81,12 @@ input, never the frame already being processed. Results are published complete,
 and their image buffers are not modified after publication. The UI must not draw
 boxes from frame N over a newer, unrelated frame N+1.
 
-`gcs_client.py` would expose an atomic frame snapshot and bounded telemetry lookup
-by the full captured frame key. Its current `telemetry_for(frame_id)` only serves
-the latest frame, so it cannot safely join an older in-flight image after another
-frame arrives. The proposed lookup must return a snapshot for the requested key
-without requiring that key to remain the latest, and must reject retired streams.
+`gcs_client.py` currently exposes `latest_snapshot()`, which atomically captures
+the latest frame and its available matching telemetry. The proposed vision worker
+also needs bounded telemetry lookup by a full captured frame key to wait briefly
+for missing pose while newer frames arrive. The existing `telemetry_for(frame_id)`
+only serves the latest frame. The proposed lookup must serve the requested key
+without requiring it to remain the latest, and must reject retired streams.
 
 ## 4. Proposed simulated vehicles
 

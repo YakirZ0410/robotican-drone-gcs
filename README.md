@@ -231,6 +231,9 @@ All command-line options are available with:
   timestamp. The GCS matches both values; it does not compare clocks on different
   computers. Missing matching telemetry is reported rather than replaced with
   data from an unrelated frame.
+- The GUI captures the latest frame and its available matching telemetry under
+  one lock. JPEG decoding and Qt updates happen after releasing the lock. If
+  matching telemetry is missing at capture, a subsequent refresh can fill it.
 - Telemetry uses UDP to avoid waiting for old snapshots to be retransmitted.
   Lost telemetry is not recovered; subsequent frames provide new snapshots.
 - Command sequence numbers reject older commands. Repeated commands and the
@@ -332,6 +335,8 @@ handler cleanup, fatal tracebacks and watchdog transition events.
 Deterministic simulator-loop tests inject a two-second clock gap and verify
 bounded movement with no new command, a new opposite command, or a duplicate
 keepalive, as well as correct battery drain across command expiry.
+Snapshot tests cover coherent frame/telemetry capture, caller-isolated metadata,
+new frames arriving during JPEG decoding and delayed matching telemetry.
 
 ## Troubleshooting and current limitations
 

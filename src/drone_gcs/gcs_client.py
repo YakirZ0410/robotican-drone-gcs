@@ -209,6 +209,23 @@ class GCSClient:
                     oldest_key = next(iter(self._telemetry))
                     del self._telemetry[oldest_key]
 
+    def latest_snapshot(self) -> tuple[int, int, bytes, dict | None] | None:
+        """Capture the latest frame and its available matching pose atomically.
+
+        JPEG bytes are immutable; copy the flat telemetry dictionary so callers
+        cannot mutate the cache. Decoding and presentation happen after return.
+        """
+        with self._lock:
+            if self._latest_frame is None:
+                return None
+
+            frame_id, timestamp_ns, jpeg = self._latest_frame
+            telemetry = self._telemetry.get((frame_id, timestamp_ns))
+            return (
+                frame_id, timestamp_ns, jpeg,
+                telemetry.copy() if telemetry is not None else None,
+            )
+
     def latest_frame(self) -> tuple[int, int, bytes] | None:
         """Return the newest complete JPEG frame."""
 

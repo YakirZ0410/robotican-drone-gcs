@@ -221,6 +221,40 @@ class TestFrameTelemetryMatching(unittest.TestCase):
         )
         self.client.poll()
 
+    def test_snapshot_requires_video_and_accepts_telemetry_first(self):
+        self.assertIsNone(self.client.latest_snapshot())
+        self.deliver_telemetry(42, 1000, x=12.0)
+        self.assertIsNone(self.client.latest_snapshot())
+        self.deliver_video(42, 1000)
+        frame_id, timestamp_ns, jpeg, telemetry = self.client.latest_snapshot()
+        self.assertEqual((frame_id, timestamp_ns, jpeg), (42, 1000, b"frame-bytes"))
+        self.assertEqual((telemetry["frame_id"], telemetry["timestamp_ns"], telemetry["x"]), (42, 1000, 12.0))
+
+    def test_snapshot_matches_full_key_and_later_matching_telemetry(self):
+        self.deliver_video(42, 1000)
+        self.assertEqual(self.client.latest_snapshot(), (42, 1000, b"frame-bytes", None))
+        self.deliver_telemetry(42, 2000, x=99.0)
+        self.assertIsNone(self.client.latest_snapshot()[3])
+        self.deliver_telemetry(42, 1000, x=12.0)
+        snapshot = self.client.latest_snapshot()
+        self.assertEqual(snapshot[:2], (42, 1000))
+        self.assertEqual(snapshot[3]["x"], 12.0)
+
+    def test_snapshot_is_stable_after_new_data_and_does_not_expose_cached_dict(self):
+        self.deliver_video(42, 1000)
+        self.deliver_telemetry(42, 1000, x=12.0)
+        captured = self.client.latest_snapshot()
+        self.deliver_video(42, 2000)
+        self.deliver_telemetry(42, 2000, x=99.0)
+
+        self.assertEqual(captured[:2], (42, 1000))
+        self.assertEqual(captured[3]["x"], 12.0)
+        current = self.client.latest_snapshot()
+        self.assertEqual(current[:2], (42, 2000))
+        self.assertEqual(current[3]["x"], 99.0)
+        current[3]["x"] = -999.0
+        self.assertEqual(self.client.latest_snapshot()[3]["x"], 99.0)
+
     def test_video_first_waits_until_matching_telemetry_arrives(self):
         self.deliver_video(42, 1000)
         self.assertIsNotNone(self.client.latest_frame())

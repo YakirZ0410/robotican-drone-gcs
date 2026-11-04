@@ -149,6 +149,16 @@ class TestVideoStreamStatus(unittest.TestCase):
         self.assertIn("waiting for matching telemetry", self.window.telemetry_label.text())
         self.assertNotIn("87.0%", self.window.telemetry_label.text())
 
+    def test_delayed_telemetry_fills_the_already_displayed_frame(self):
+        self.deliver_frame(1, telemetry=False)
+        self.assertIn("waiting for matching telemetry", self.window.telemetry_label.text())
+        self.deliver_telemetry(1)
+        self.client.poll()
+        self.window._update_display()
+        self.assertEqual(self.window.last_displayed_frame, (1, 1000))
+        self.assertIn("X=12.00", self.window.telemetry_label.text())
+        self.assertNotIn("waiting for matching telemetry", self.window.telemetry_label.text())
+
     def test_command_send_failure_stays_visible_until_a_successful_send(self):
         self.deliver_frame(1)
         with patch.object(
@@ -212,6 +222,8 @@ class TestVideoStreamStatus(unittest.TestCase):
             self.deliver_frame(1, state=DroneState(x=12.0, last_seq=4))
 
         self.assertEqual(self.window.last_displayed_frame, (1, 1000))
+        self.assertIn("X=12.00", self.window.telemetry_label.text())
+        self.assertNotIn("waiting for matching telemetry", self.window.telemetry_label.text())
         self.assertNotIn("X=99.00", self.window.telemetry_label.text())
         self.window._update_display()
         self.assertEqual(self.window.last_displayed_frame, (1, 2000))
