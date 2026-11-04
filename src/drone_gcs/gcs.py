@@ -4,6 +4,7 @@
 import sys
 import argparse
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -23,6 +24,9 @@ from drone_gcs.gcs_client import (
     GCSClient,
     velocity_from_keys,
 )
+
+
+VIDEO_TIMEOUT_S = 1.0
 
 
 KEY_MAP = {
@@ -88,6 +92,10 @@ class GCSWindow(QMainWindow):
 
         self.last_displayed_frame = None
         self.original_pixmap = None
+        self.started_at = time.monotonic()
+        self.last_video_at = None
+        self.telemetry_text = "Waiting for matching telemetry..."
+        self.command_error = None
 
         self.stop_event = threading.Event()
 
@@ -137,16 +145,16 @@ class GCSWindow(QMainWindow):
             "font-size: 16px; font-weight: bold;"
         )
 
-        self.telemetry_label = QLabel(
-            "Waiting for matching telemetry..."
-        )
+        self.telemetry_label = QLabel(self.telemetry_text)
+        self.telemetry_label.setWordWrap(True)
         self.telemetry_label.setStyleSheet(
             "font-size: 15px;"
         )
 
         self.command_label = QLabel(
-            "Command: VX=0.0 | VY=0.0"
+            "Command: WAITING TO SEND"
         )
+        self.command_label.setWordWrap(True)
 
         self.instructions_label = QLabel(
             "Controls: W/S - Forward/Backward | "
@@ -186,7 +194,8 @@ class GCSWindow(QMainWindow):
     def _send_command(self):
         """Send velocity commands, respecting emergency stop."""
 
-        if self.stop_latched or not self.isActiveWindow():
+        window_active = self.isActiveWindow()
+        if self.stop_latched or not window_active:
             vx, vy = 0.0, 0.0
         else:
             vx, vy = velocity_from_keys(self.pressed_keys)
@@ -195,82 +204,105 @@ class GCSWindow(QMainWindow):
             self.client.send_command(vx, vy)
 
         except (OSError, RuntimeError) as exc:
-            self.connection_label.setText(
-                f"Command send error: {exc}"
-            )
+            self.command_error = f"Command send error: {exc}"
+            self.command_label.setText("Command: SEND FAILED")
+            self._update_video_status(time.monotonic())
             return
 
+        self.command_error = None
+        command_status = (
+            "ZERO VELOCITY SENT" if vx == 0.0 and vy == 0.0 else "MOVEMENT SENT"
+        )
+        command_text = f"Command: {command_status} | VX={vx:.1f} | VY={vy:.1f}"
         if self.stop_latched:
-            self.command_label.setText(
-                "Command: VX=0.0 | VY=0.0 | STOP ACTIVE"
-            )
-        else:
-            self.command_label.setText(
-                f"Command: VX={vx:.1f} | VY={vy:.1f}"
-            )
+            command_text += " | STOP ACTIVE"
+        elif not window_active:
+            command_text += " | WINDOW INACTIVE"
+        self.command_label.setText(command_text)
 
     def _update_display(self):
-        """Display the newest frame and matching telemetry."""
+        """Display matching data and detect loss using the local clock."""
 
+        now = time.monotonic()
         latest = self.client.latest_frame()
 
-        if latest is None:
-            return
+        if latest is not None:
+            frame_id, timestamp_ns, jpeg = latest
+            frame_key = (frame_id, timestamp_ns)
 
-        frame_id, timestamp_ns, jpeg = latest
-        frame_key = (frame_id, timestamp_ns)
+            if frame_key != self.last_displayed_frame:
+                encoded = np.frombuffer(jpeg, dtype=np.uint8)
+                try:
+                    frame = cv2.imdecode(encoded, cv2.IMREAD_COLOR)
+                except cv2.error:
+                    frame = None
 
-        if frame_key != self.last_displayed_frame:
-            encoded = np.frombuffer(jpeg, dtype=np.uint8)
+                if frame is not None:
+                    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    height, width, channels = rgb.shape
+                    qimage = QImage(
+                        rgb.data, width, height, channels * width,
+                        QImage.Format.Format_RGB888,
+                    ).copy()
+                    self.original_pixmap = QPixmap.fromImage(qimage)
+                    self._scale_video()
+                    self.last_displayed_frame = frame_key
+                    self.last_video_at = now
+                    self.telemetry_text = (
+                        f"Frame {frame_id}: waiting for matching telemetry"
+                    )
 
-            frame = cv2.imdecode(
-                encoded,
-                cv2.IMREAD_COLOR,
+            # Never pair telemetry for an undecodable image with the old image.
+            if frame_key == self.last_displayed_frame:
+                telemetry = self.client.telemetry_for(frame_id)
+                if telemetry is not None and (
+                    telemetry["frame_id"], telemetry["timestamp_ns"]
+                ) == frame_key:
+                    self.telemetry_text = (
+                        f"Position: X={telemetry['x']:.2f}, "
+                        f"Y={telemetry['y']:.2f}  |  "
+                        f"Speed: {telemetry['speed']:.2f}  |  "
+                        f"Battery: {telemetry['battery_pct']:.1f}%\n"
+                        f"Applied velocity: VX={telemetry['vx']:.2f} | "
+                        f"VY={telemetry['vy']:.2f} | "
+                        f"Last command: {telemetry['last_seq']}"
+                    )
+
+        self._update_video_status(now)
+
+    def _update_video_status(self, now: float):
+        """Keep the last image and clearly mark retained values as stale."""
+
+        telemetry_text = self.telemetry_text
+        if self.last_video_at is None:
+            if now - self.started_at >= VIDEO_TIMEOUT_S:
+                status = "No video received | Check drone and network"
+                color = "#c0392b"
+            else:
+                status = "Waiting for drone..."
+                color = "#34495e"
+        elif now - self.last_video_at >= VIDEO_TIMEOUT_S:
+            status = (
+                "Video stream lost | Last frame ID: "
+                f"{self.last_displayed_frame[0]}"
             )
-
-            if frame is not None:
-                rgb = cv2.cvtColor(
-                    frame,
-                    cv2.COLOR_BGR2RGB,
-                )
-
-                height, width, channels = rgb.shape
-
-                qimage = QImage(
-                    rgb.data,
-                    width,
-                    height,
-                    channels * width,
-                    QImage.Format.Format_RGB888,
-                ).copy()
-
-                self.original_pixmap = QPixmap.fromImage(
-                    qimage
-                )
-
-                self._scale_video()
-
-                self.last_displayed_frame = frame_key
-
-                self.connection_label.setText(
-                    f"Receiving video | Frame ID: {frame_id}"
-                )
-
-        telemetry = self.client.telemetry_for(frame_id)
-
-        if telemetry is None:
-            self.telemetry_label.setText(
-                f"Frame {frame_id}: waiting for matching telemetry"
+            color = "#c0392b"
+            telemetry_text = f"STALE | {telemetry_text}"
+        else:
+            status = (
+                "Receiving video | Frame ID: "
+                f"{self.last_displayed_frame[0]}"
             )
-            return
+            color = "#218c4a"
 
-        self.telemetry_label.setText(
-            f"Position: X={telemetry['x']:.2f}, "
-            f"Y={telemetry['y']:.2f}  |  "
-            f"Speed: {telemetry['speed']:.2f}  |  "
-            f"Battery: {telemetry['battery_pct']:.1f}%  |  "
-            f"Last command: {telemetry['last_seq']}"
+        if self.command_error is not None:
+            status = f"{status} | {self.command_error}"
+            color = "#c0392b"
+        self.connection_label.setText(status)
+        self.connection_label.setStyleSheet(
+            f"font-size: 16px; font-weight: bold; color: {color};"
         )
+        self.telemetry_label.setText(telemetry_text)
 
     def _scale_video(self):
         """Fit the video inside the label without distortion."""
@@ -329,15 +361,8 @@ class GCSWindow(QMainWindow):
         self.stop_latched = True
         self.pressed_keys.clear()
 
-        try:
-            self.client.send_command(0.0, 0.0)
-
-        except (OSError, RuntimeError) as exc:
-            print(f"STOP command failed: {exc}", flush=True)
-
-        self.command_label.setText(
-            "Command: VX=0.0 | VY=0.0 | STOP ACTIVE"
-        )
+        # Use the same send/result path so a failed STOP never claims SENT.
+        self._send_command()
 
         self.stop_button.setText("RESUME")
         self.stop_button.setStyleSheet(RESUME_BUTTON_STYLE)

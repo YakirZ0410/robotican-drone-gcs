@@ -67,7 +67,8 @@ def _decode_message(payload: bytes, expected_type: str) -> dict:
 
     try:
         message = json.loads(payload.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError) as exc:
+        # A small datagram can still exceed the JSON parser's nesting limit.
         raise ValueError("Invalid JSON payload") from exc
 
     if not isinstance(message, dict):

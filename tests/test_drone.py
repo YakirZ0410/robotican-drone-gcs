@@ -1,11 +1,14 @@
 
+import socket
 import unittest
 
 from drone_gcs.model import VelocityCommand
 from drone_gcs.drone import (
     command_after_timeout,
+    receive_commands,
     should_accept_command,
 )
+from drone_gcs.protocol import encode_command
 
 
 class TestCommandTimeout(unittest.TestCase):
@@ -135,6 +138,46 @@ class TestCommandOrdering(unittest.TestCase):
         self.assertFalse(
             should_accept_command(incoming, self.current)
         )
+
+
+class TestCommandReception(unittest.TestCase):
+    def test_deeply_nested_json_is_ignored_and_next_command_is_received(self):
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver,
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender,
+        ):
+            receiver.bind(("127.0.0.1", 0))
+            receiver.setblocking(False)
+            payload = b'{"type":"command","x":' + b'[' * 1800 + b'0' + b']' * 1800 + b'}'
+            self.assertLess(len(payload), 4096)
+            sender.sendto(payload, receiver.getsockname())
+            expected = VelocityCommand(0.5, -0.25, 1)
+            sender.sendto(encode_command(expected), receiver.getsockname())
+
+            active, last_ns = receive_commands(
+                receiver, VelocityCommand(0.0, 0.0, -1), None,
+            )
+
+            self.assertEqual(active, expected)
+            self.assertIsNotNone(last_ns)
+
+    def test_oversized_datagram_is_ignored_and_next_command_is_received(self):
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as receiver,
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender,
+        ):
+            receiver.bind(("127.0.0.1", 0))
+            receiver.setblocking(False)
+            sender.sendto(b"x" * 4097, receiver.getsockname())
+            expected = VelocityCommand(0.5, -0.25, 1)
+            sender.sendto(encode_command(expected), receiver.getsockname())
+
+            active, last_ns = receive_commands(
+                receiver, VelocityCommand(0.0, 0.0, -1), None,
+            )
+
+            self.assertEqual(active, expected)
+            self.assertIsNotNone(last_ns)
 
 
 if __name__ == "__main__":

@@ -1,13 +1,18 @@
-
 """Headless drone simulator with UDP video and telemetry."""
 
 import argparse
+import logging
 import math
 import socket
 import time
 
 import cv2
 
+from drone_gcs.log_config import (
+    DRONE_LOGGER_NAME,
+    close_drone_logging,
+    configure_drone_logging,
+)
 from drone_gcs.model import (
     DroneState,
     VelocityCommand,
@@ -20,6 +25,11 @@ from drone_gcs.protocol import (
     encode_telemetry,
 )
 from drone_gcs.render import render_frame
+
+
+# Keep command handling responsive even when video frames are far apart.
+CONTROL_INTERVAL_S = 0.01
+LOGGER = logging.getLogger(DRONE_LOGGER_NAME)
 
 
 def command_after_timeout(
@@ -105,7 +115,9 @@ def receive_commands(
     # prevent the simulator from rendering.
     for _ in range(64):
         try:
-            payload, _address = command_socket.recvfrom(4096)
+            # Read the full datagram before JSON size validation. A smaller
+            # buffer raises WSAEMSGSIZE on Windows for oversized commands.
+            payload, _address = command_socket.recvfrom(65535)
 
         except BlockingIOError:
             break
@@ -117,12 +129,28 @@ def receive_commands(
         try:
             incoming = decode_command(payload)
 
-        except ValueError:
+        except ValueError as exc:
             # Ignore malformed commands.
+            LOGGER.debug("Ignored malformed command: %s", exc)
             continue
 
         if not should_accept_command(incoming, active_command):
+            LOGGER.debug(
+                "Command rejected: seq=%d current_seq=%d", incoming.seq, active_command.seq,
+            )
             continue
+
+        LOGGER.debug(
+            "Command accepted: seq=%d vx=%.3f vy=%.3f",
+            incoming.seq, incoming.vx, incoming.vy,
+        )
+        if last_command_ns is None or (
+            incoming.vx, incoming.vy
+        ) != (active_command.vx, active_command.vy):
+            LOGGER.info(
+                "Velocity command received: seq=%d vx=%.3f vy=%.3f",
+                incoming.seq, incoming.vx, incoming.vy,
+            )
 
         if incoming.seq > active_command.seq:
             active_command = incoming
@@ -170,26 +198,21 @@ def run_simulator(args: argparse.Namespace) -> None:
 
         command_socket.setblocking(False)
 
-        print(
-            f"Drone listening for commands on "
-            f"{args.bind_host}:{args.command_port}"
+        LOGGER.info(
+            "Simulator started: command_bind=%s:%d video_target=%s:%d telemetry_target=%s:%d",
+            args.bind_host, args.command_port, args.gcs_host, args.video_port,
+            args.gcs_host, args.telemetry_port,
         )
-
-        print(
-            f"Video target: {args.gcs_host}:{args.video_port}"
+        LOGGER.info(
+            "Video: %dx%d fps=%s jpeg_quality=%d command_timeout_ms=%d",
+            args.width, args.height, args.fps, args.jpeg_quality, args.command_timeout_ms,
         )
-
-        print(
-            f"Telemetry target: "
-            f"{args.gcs_host}:{args.telemetry_port}"
-        )
-
-        print(f"Video: {args.width}x{args.height} @ {args.fps} FPS")
-        print("Press Ctrl+C to stop.")
+        LOGGER.info("Waiting for commands; press Ctrl+C to stop")
 
         last_update_ns = time.monotonic_ns()
         next_frame_at = time.monotonic()
         last_warning_ns = 0
+        watchdog_expired = False
 
         while True:
 
@@ -206,7 +229,11 @@ def run_simulator(args: argparse.Namespace) -> None:
             dt_s = (now_ns - last_update_ns) / 1_000_000_000
             last_update_ns = now_ns
 
-            # 3. Apply the command watchdog.
+            # 3. Integrate the velocity that was active during this interval.
+            # A newly received command must not move the drone retroactively.
+            state = advance_state(state, dt_s)
+
+            # 4. Apply the command watchdog and update the current velocity.
             effective_command = command_after_timeout(
                 last_ns=last_command_ns,
                 now_ns=now_ns,
@@ -214,9 +241,24 @@ def run_simulator(args: argparse.Namespace) -> None:
                 active=active_command,
             )
 
-            # 4. Update the drone state.
+            timed_out = last_command_ns is not None and (
+                now_ns < last_command_ns or now_ns - last_command_ns >= timeout_ns
+            )
+            if timed_out and not watchdog_expired:
+                LOGGER.warning(
+                    "Command timeout: last_seq=%d; velocity set to zero", active_command.seq,
+                )
+            elif watchdog_expired and not timed_out:
+                LOGGER.info("Commands resumed: seq=%d", active_command.seq)
+            watchdog_expired = timed_out
+
             state = apply_command(state, effective_command)
-            state = advance_state(state, dt_s)
+
+            # Video scheduling must not suspend command/watchdog processing.
+            remaining_s = next_frame_at - time.monotonic()
+            if remaining_s > 0:
+                time.sleep(min(remaining_s, CONTROL_INTERVAL_S))
+                continue
 
             # 5. Render the camera image.
             frame = render_frame(
@@ -269,7 +311,7 @@ def run_simulator(args: argparse.Namespace) -> None:
             except OSError as exc:
                 # A receiver may not be running yet.
                 if now_ns - last_warning_ns >= 1_000_000_000:
-                    print(f"UDP send warning: {exc}")
+                    LOGGER.warning("UDP send failed: frame_id=%d error=%s", frame_id, exc)
                     last_warning_ns = now_ns
 
             # 9. Move to the next frame ID.
@@ -281,7 +323,7 @@ def run_simulator(args: argparse.Namespace) -> None:
             remaining_s = next_frame_at - time.monotonic()
 
             if remaining_s > 0:
-                time.sleep(remaining_s)
+                time.sleep(min(remaining_s, CONTROL_INTERVAL_S))
             else:
                 # Avoid accumulating delays if rendering is slow.
                 next_frame_at = time.monotonic()
@@ -289,6 +331,7 @@ def run_simulator(args: argparse.Namespace) -> None:
     finally:
         command_socket.close()
         sender_socket.close()
+        LOGGER.info("Simulator sockets closed")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -356,6 +399,19 @@ def main(argv: list[str] | None = None) -> int:
         default=500,
     )
 
+    parser.add_argument(
+        "--log-file",
+        default="logs/drone.log",
+        help="Rotating log file path (default: logs/drone.log)",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str.upper,
+        choices=("INFO", "DEBUG"),
+        default="INFO",
+        help="Log detail (default: INFO)",
+    )
+
     args = parser.parse_args(argv)
 
     if not math.isfinite(args.fps) or not 0 < args.fps <= 60:
@@ -378,11 +434,17 @@ def main(argv: list[str] | None = None) -> int:
         if not 1 <= port <= 65535:
             parser.error("Ports must be between 1 and 65535")
 
+    configure_drone_logging(args.log_file, args.log_level)
     try:
         run_simulator(args)
 
     except KeyboardInterrupt:
-        print("\nDrone simulator stopped.")
+        LOGGER.info("Simulator stopped by user")
+    except Exception:
+        LOGGER.exception("Simulator failed")
+        return 1
+    finally:
+        close_drone_logging()
 
     return 0
 

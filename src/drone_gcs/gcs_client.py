@@ -197,6 +197,11 @@ class GCSClient:
             )
 
             with self._lock:
+                # Recover after a GCS restart without resetting the drone's
+                # ordering guard. Delayed telemetry must never rewind us.
+                self._sequence = max(
+                    self._sequence, telemetry["last_seq"] + 1
+                )
                 self._telemetry[key] = telemetry
 
                 # Keep telemetry memory bounded.
