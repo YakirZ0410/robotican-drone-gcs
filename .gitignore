@@ -24,3 +24,7 @@ dist/
 # Secrets
 .env
 .env.*
+
+# Local development notes
+/docs/superpowers/
+/docs/project_review.md
